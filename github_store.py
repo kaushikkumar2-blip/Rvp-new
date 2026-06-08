@@ -29,6 +29,10 @@ RAW_ROOT = "https://raw.githubusercontent.com"
 SNAPSHOT_ROOT = "snapshots"
 INDEX_PATH = f"{SNAPSHOT_ROOT}/index.json"
 
+# Separate area for saved BIC pincode lists (independent of snapshots).
+BIC_ROOT = "bic_lists"
+BIC_INDEX_PATH = f"{BIC_ROOT}/index.json"
+
 # The seven tables that make up a snapshot.
 TABLES = (
     "daily_attempt_pct",
@@ -363,3 +367,155 @@ def load_snapshot(snapshot_id: str) -> dict[str, pd.DataFrame]:
 def clear_caches() -> None:
     """Invalidate the per-table fetch cache (call after save/delete)."""
     _load_table_cached.clear()
+
+
+# ---------------------------------------------------------------------------
+# BIC pincode lists (separate namespace from snapshots)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class BicListMeta:
+    bic_id: str                # folder name, e.g. "2026-06-08T093412Z__bic-default"
+    label: str                 # human label
+    pincode_count: int
+    uploaded_at: str           # ISO 8601 UTC
+    source_filename: str       # original CSV filename, for traceability
+
+    def to_dict(self) -> dict:
+        return {
+            "bic_id": self.bic_id,
+            "label": self.label,
+            "pincode_count": self.pincode_count,
+            "uploaded_at": self.uploaded_at,
+            "source_filename": self.source_filename,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "BicListMeta":
+        return cls(
+            bic_id=d["bic_id"],
+            label=d.get("label", d["bic_id"]),
+            pincode_count=int(d.get("pincode_count", 0)),
+            uploaded_at=d["uploaded_at"],
+            source_filename=d.get("source_filename", ""),
+        )
+
+
+def make_bic_id(label: str) -> str:
+    """Sortable, filesystem-safe id for a BIC list."""
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H%M%SZ")
+    slug = "".join(c if c.isalnum() or c in "-_" else "-" for c in label.lower()).strip("-")
+    slug = slug[:40] or "bic"
+    return f"{ts}__{slug}"
+
+
+def _read_bic_index(cfg: dict) -> list[dict]:
+    raw = _fetch_raw(cfg, BIC_INDEX_PATH)
+    if raw is None:
+        return []
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except json.JSONDecodeError:
+        return []
+
+
+def _write_bic_index(cfg: dict, entries: list[dict], message: str) -> None:
+    body = json.dumps(entries, indent=2, sort_keys=True).encode("utf-8")
+    _put_file(cfg, BIC_INDEX_PATH, body, message)
+
+
+def list_bic_lists() -> list[BicListMeta]:
+    """Return saved BIC lists, newest first."""
+    cfg = _config()
+    entries = _read_bic_index(cfg)
+    metas = [BicListMeta.from_dict(e) for e in entries]
+    metas.sort(key=lambda m: m.uploaded_at, reverse=True)
+    return metas
+
+
+def save_bic_list(
+    *,
+    label: str,
+    pincodes: list[str],
+    source_filename: str = "",
+    overwrite_id: Optional[str] = None,
+) -> BicListMeta:
+    """Upload a BIC pincode list folder + update the BIC manifest.
+
+    Pincodes are stored as a single-column Parquet file for compactness.
+    """
+    cfg = _config()
+    bic_id = overwrite_id or make_bic_id(label)
+    folder = f"{BIC_ROOT}/{bic_id}"
+
+    cleaned = [str(p).strip() for p in pincodes if str(p).strip()]
+    df = pd.DataFrame({"Pincode": cleaned})
+    buf = io.BytesIO()
+    df.to_parquet(buf, engine="pyarrow", compression="zstd", index=False)
+    _put_file(cfg, f"{folder}/pincodes.parquet", buf.getvalue(),
+              f"bic {bic_id}: pincodes")
+
+    meta = BicListMeta(
+        bic_id=bic_id,
+        label=label,
+        pincode_count=len(df),
+        uploaded_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        source_filename=source_filename,
+    )
+    _put_file(cfg, f"{folder}/meta.json",
+              json.dumps(meta.to_dict(), indent=2).encode("utf-8"),
+              f"bic {bic_id}: meta")
+
+    entries = _read_bic_index(cfg)
+    entries = [e for e in entries if e.get("bic_id") != bic_id]
+    entries.append(meta.to_dict())
+    _write_bic_index(cfg, entries, f"bic index: add/update {bic_id}")
+    return meta
+
+
+@st.cache_data(show_spinner=False, ttl=300)
+def _load_bic_cached(repo: str, branch: str, bic_id: str,
+                     token: str) -> Optional[bytes]:
+    url = f"{RAW_ROOT}/{repo}/{branch}/{BIC_ROOT}/{bic_id}/pincodes.parquet"
+    r = requests.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=60)
+    if r.status_code == 404:
+        return None
+    r.raise_for_status()
+    return r.content
+
+
+def load_bic_list(bic_id: str) -> frozenset[str]:
+    """Return the set of pincodes for the given BIC list id."""
+    cfg = _config()
+    raw = _load_bic_cached(cfg["repo"], cfg["branch"], bic_id, cfg["token"])
+    if raw is None:
+        return frozenset()
+    df = pd.read_parquet(io.BytesIO(raw), engine="pyarrow")
+    col = "Pincode" if "Pincode" in df.columns else df.columns[0]
+    series = df[col].dropna().astype(str).str.strip()
+    series = series[series != ""]
+    return frozenset(series)
+
+
+def delete_bic_list(bic_id: str) -> None:
+    cfg = _config()
+    folder = f"{BIC_ROOT}/{bic_id}"
+    for fname in ("pincodes.parquet", "meta.json"):
+        try:
+            _delete_file(cfg, f"{folder}/{fname}", f"delete bic {bic_id}")
+        except requests.HTTPError:
+            pass
+    entries = [e for e in _read_bic_index(cfg) if e.get("bic_id") != bic_id]
+    _write_bic_index(cfg, entries, f"bic index: remove {bic_id}")
+
+
+def bic_list_exists_for_label(label: str) -> Optional[BicListMeta]:
+    """Return the most recent BIC list with this exact label, or None."""
+    for m in list_bic_lists():
+        if m.label == label:
+            return m
+    return None
+
+
+def clear_bic_caches() -> None:
+    _load_bic_cached.clear()

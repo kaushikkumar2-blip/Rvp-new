@@ -42,6 +42,12 @@ REQUIRED_COLS = [
     "shipment_status_reason",
 ]
 
+# Pulled through parsing when present; absent in some legacy files so we don't
+# fail the upload if a column here is missing.
+OPTIONAL_COLS = [
+    "destination_pincode",
+]
+
 # Explicit dtypes cut memory ~50% and let pandas skip type inference.
 CSV_DTYPES = {
     "vendor_tracking_id": "string",
@@ -50,6 +56,7 @@ CSV_DTYPES = {
     "Request_created_date": "string",
     "First_pickup_date": "string",
     "rvp_pickup_completed_date": "string",
+    "destination_pincode": "string",
 }
 
 
@@ -189,15 +196,19 @@ def conversion_table(df: pd.DataFrame, group_col: str = "seller_type") -> pd.Dat
 # ---------------------------------------------------------------------------
 
 def read_csv_fast(content: bytes) -> pd.DataFrame:
-    """Read only required columns with explicit dtypes. Tries pyarrow first."""
+    """Read required + optional columns with explicit dtypes.
+
+    Optional columns are tolerated as missing: we use a callable for usecols so
+    pandas silently skips columns that aren't in the file's header.
+    """
+    wanted = set(REQUIRED_COLS) | set(OPTIONAL_COLS)
+    usecols = lambda c: c in wanted  # noqa: E731 - tiny predicate
     for encoding in ("utf-8", "utf-8-sig", "cp1252", "latin-1"):
         try:
-            # pyarrow engine is much faster on big CSVs but doesn't accept dtype
-            # for some versions; try it without dtype, then python parse.
             return pd.read_csv(
                 io.BytesIO(content),
                 encoding=encoding,
-                usecols=REQUIRED_COLS,
+                usecols=usecols,
                 dtype=CSV_DTYPES,
                 engine="c",
                 low_memory=False,
@@ -205,10 +216,9 @@ def read_csv_fast(content: bytes) -> pd.DataFrame:
         except UnicodeDecodeError:
             continue
         except ValueError as exc:
-            # usecols may complain if columns are missing - let caller see error.
             raise exc
     return pd.read_csv(io.BytesIO(content), encoding="latin-1",
-                       usecols=REQUIRED_COLS, dtype=CSV_DTYPES,
+                       usecols=usecols, dtype=CSV_DTYPES,
                        on_bad_lines="skip")
 
 
@@ -225,12 +235,46 @@ def read_bytes(content: bytes, filename: str,
         sheet_name = DEFAULT_SHEET if DEFAULT_SHEET in xl.sheet_names else xl.sheet_names[0]
     # Excel: read all then prune (openpyxl doesn't have usecols-by-name reliably).
     df = pd.read_excel(io.BytesIO(content), sheet_name=sheet_name)
-    keep = [c for c in REQUIRED_COLS if c in df.columns]
+    wanted = REQUIRED_COLS + OPTIONAL_COLS
+    keep = [c for c in wanted if c in df.columns]
     return df[keep] if keep else df
 
 
 def list_sheets(content: bytes) -> list[str]:
     return pd.ExcelFile(io.BytesIO(content)).sheet_names
+
+
+@st.cache_data(show_spinner="Reading BIC pincodes...", max_entries=4)
+def load_bic_pincodes(content: bytes) -> frozenset[str]:
+    """Parse a single-column pincode CSV into a normalized frozenset.
+
+    Tolerates a few common header spellings (Pincode/pincode/PIN/pin_code).
+    Returns stripped strings to match the normalization done in
+    parse_and_enrich for `destination_pincode`.
+    """
+    candidates = ("Pincode", "pincode", "PIN", "pin", "pin_code", "Pin")
+    last_err: Optional[Exception] = None
+    for encoding in ("utf-8", "utf-8-sig", "cp1252", "latin-1"):
+        try:
+            df = pd.read_csv(io.BytesIO(content), encoding=encoding, dtype=str)
+            break
+        except UnicodeDecodeError as exc:
+            last_err = exc
+            continue
+    else:
+        raise ValueError(f"Could not decode pincode CSV: {last_err}")
+
+    col = next((c for c in candidates if c in df.columns), None)
+    if col is None:
+        # Fall back to the first column if header doesn't match a known name.
+        if df.shape[1] == 0:
+            raise ValueError("Pincode CSV has no columns.")
+        col = df.columns[0]
+
+    series = df[col].dropna().astype(str).str.strip()
+    series = series.str.replace(r"\.0$", "", regex=True)
+    series = series[series != ""]
+    return frozenset(series)
 
 
 def missing_cols(df: pd.DataFrame) -> list[str]:
@@ -257,6 +301,13 @@ def parse_and_enrich(content: bytes, filename: str,
     df["First_pickup_date"] = pd.to_datetime(
         df["First_pickup_date"], errors="coerce", dayfirst=True
     )
+    if "destination_pincode" in df.columns:
+        # Pincodes can arrive as int, float, or string with whitespace; coerce
+        # to a clean string so set-membership checks against the BIC list work.
+        pin = df["destination_pincode"].astype("string").str.strip()
+        # Drop a trailing ".0" left over when pandas reads ints via float.
+        pin = pin.str.replace(r"\.0$", "", regex=True)
+        df["destination_pincode"] = pin
     bucket, _ = compute_attempt(df)
     df = df.assign(
         AttemptBucket=bucket,
@@ -787,6 +838,400 @@ def render_attempt_page() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Pincode Performance page: client x BIC/Non-BIC pickup performance
+# ---------------------------------------------------------------------------
+
+def _render_bic_upload() -> Optional[Tuple[frozenset, str]]:
+    """Upload-and-save flow. Returns (bic_set, source_label) or None."""
+    bic_file = st.file_uploader(
+        "Upload BIC pincode CSV (a single column named `Pincode`)",
+        type=["csv"], key="bic_uploader",
+    )
+    if bic_file is not None:
+        st.session_state["_bic_bytes"] = bic_file.getvalue()
+        st.session_state["_bic_name"] = bic_file.name
+
+    bic_bytes = st.session_state.get("_bic_bytes")
+    bic_name = st.session_state.get("_bic_name")
+    if bic_bytes is None:
+        st.info("Upload a BIC pincode CSV to continue.")
+        return None
+
+    try:
+        bic_set = load_bic_pincodes(bic_bytes)
+    except Exception as exc:
+        st.error(f"Could not read BIC pincode CSV: {exc}")
+        return None
+
+    info_col, clear_col = st.columns([6, 1])
+    info_col.caption(
+        f"Using `{bic_name}` — {len(bic_set):,} unique BIC pincodes loaded."
+    )
+    if clear_col.button("Clear", key="bic_clear",
+                        help="Remove the uploaded BIC pincode file"):
+        st.session_state.pop("_bic_bytes", None)
+        st.session_state.pop("_bic_name", None)
+        st.rerun()
+
+    if ghs.is_configured():
+        _render_bic_save_section(bic_set, bic_name or "")
+
+    return bic_set, bic_name or "uploaded"
+
+
+def _render_bic_save_section(bic_set: frozenset, source_filename: str) -> None:
+    """Save-to-GitHub UI for the currently loaded BIC list."""
+    with st.expander("Save BIC list to GitHub", expanded=False):
+        default_label = (source_filename.rsplit(".", 1)[0]
+                         if source_filename else "BIC list")
+        label = st.text_input("BIC list label", value=default_label,
+                              key="bic_save_label",
+                              help="Free-text identifier. Shown in dropdowns.")
+        st.caption(f"{len(bic_set):,} unique pincodes will be saved.")
+
+        if st.button("Save BIC list", type="primary", key="bic_save_btn"):
+            try:
+                existing = ghs.bic_list_exists_for_label(label)
+            except Exception as exc:
+                st.error(f"GitHub check failed: {exc}")
+                return
+
+            if existing and not st.session_state.get("_confirm_bic_overwrite"):
+                st.session_state["_confirm_bic_overwrite"] = existing.bic_id
+                st.warning(
+                    f"A BIC list labeled **{label}** already exists "
+                    f"(`{existing.bic_id}`, uploaded {existing.uploaded_at}). "
+                    "Click **Confirm overwrite** to replace, or **Save as new** "
+                    "to keep both."
+                )
+                return
+            _do_bic_save(bic_set, label, source_filename, overwrite_id=None)
+
+        if st.session_state.get("_confirm_bic_overwrite"):
+            c1, c2, c3 = st.columns(3)
+            if c1.button("Confirm overwrite", type="primary",
+                         key="confirm_bic_overwrite_btn"):
+                _do_bic_save(
+                    bic_set,
+                    st.session_state.get("bic_save_label", default_label),
+                    source_filename,
+                    overwrite_id=st.session_state["_confirm_bic_overwrite"],
+                )
+                st.session_state.pop("_confirm_bic_overwrite", None)
+            if c2.button("Save as new", key="bic_save_new_btn"):
+                _do_bic_save(
+                    bic_set,
+                    st.session_state.get("bic_save_label", default_label),
+                    source_filename, overwrite_id=None,
+                )
+                st.session_state.pop("_confirm_bic_overwrite", None)
+            if c3.button("Cancel", key="bic_cancel_save_btn"):
+                st.session_state.pop("_confirm_bic_overwrite", None)
+                st.rerun()
+
+
+def _do_bic_save(bic_set: frozenset, label: str, source_filename: str,
+                 overwrite_id: Optional[str]) -> None:
+    try:
+        with st.spinner("Uploading BIC list to GitHub..."):
+            meta = ghs.save_bic_list(
+                label=label,
+                pincodes=sorted(bic_set),
+                source_filename=source_filename,
+                overwrite_id=overwrite_id,
+            )
+        ghs.clear_bic_caches()
+        st.success(
+            f"Saved BIC list `{meta.bic_id}` "
+            f"({meta.pincode_count:,} pincodes)."
+        )
+    except ghs.GitHubConfigError as exc:
+        st.error(str(exc))
+    except Exception as exc:
+        st.error(f"BIC list save failed: {exc}")
+
+
+def _render_bic_github_load() -> Optional[Tuple[frozenset, str]]:
+    """Load-from-GitHub picker. Returns (bic_set, label) or None."""
+    if not ghs.is_configured():
+        st.error("GitHub is not configured.")
+        return None
+
+    try:
+        lists = ghs.list_bic_lists()
+    except Exception as exc:
+        st.error(f"Could not list BIC lists: {exc}")
+        return None
+
+    if not lists:
+        st.info(
+            "No BIC lists saved on GitHub yet. Switch to **Upload BIC CSV** "
+            "to save your first one."
+        )
+        return None
+
+    options = {
+        f"{m.label} · {m.pincode_count:,} pincodes ({m.uploaded_at[:10]})": m
+        for m in lists
+    }
+    pick = st.selectbox("BIC list", list(options.keys()), key="bic_gh_pick")
+    meta = options[pick]
+
+    try:
+        with st.spinner("Loading BIC list from GitHub..."):
+            bic_set = ghs.load_bic_list(meta.bic_id)
+    except Exception as exc:
+        st.error(f"Load failed: {exc}")
+        return None
+
+    if not bic_set:
+        st.warning("That BIC list is empty.")
+        return None
+
+    st.caption(
+        f"Loaded **{meta.label}** — {len(bic_set):,} pincodes "
+        f"(saved {meta.uploaded_at})."
+    )
+
+    with st.expander("Danger zone", expanded=False):
+        if st.button("Delete this BIC list", key="delete_bic_btn"):
+            try:
+                ghs.delete_bic_list(meta.bic_id)
+                ghs.clear_bic_caches()
+                st.success("Deleted. Refreshing...")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Delete failed: {exc}")
+
+    return bic_set, meta.label
+
+
+def _get_bic_set() -> Optional[Tuple[frozenset, str]]:
+    """Resolve a BIC pincode set from either Upload or GitHub. Returns
+    `(bic_set, source_label)` or `None` if not yet ready."""
+    st.subheader("BIC pincode list")
+    sources = ["Upload BIC CSV"]
+    if ghs.is_configured():
+        sources.append("Load from GitHub")
+    if len(sources) == 1:
+        return _render_bic_upload()
+
+    source = st.radio(
+        "BIC source", sources, horizontal=True, key="bic_source_mode",
+    )
+    if source == "Upload BIC CSV":
+        return _render_bic_upload()
+    return _render_bic_github_load()
+
+
+def render_pincode_performance_page() -> None:
+    st.title("Pincode Performance")
+    st.caption(
+        "Pickup performance for one chosen client (seller_type), sliced by "
+        "whether the destination pincode is in the uploaded BIC list. "
+        "D0..D4+ are cumulative — D2 includes D0-D1, etc."
+    )
+
+    mode, df, _snap = _source_picker()
+    if mode == "Load from GitHub":
+        st.info(
+            "Pincode Performance needs raw shipment rows. Switch the source "
+            "above to **Upload new file** to use this page."
+        )
+        return
+
+    if df is None:
+        return
+
+    if "destination_pincode" not in df.columns:
+        st.warning(
+            "The uploaded shipment file does not contain a "
+            "`destination_pincode` column, so pincode performance cannot be "
+            "computed. Re-upload a file that includes it."
+        )
+        return
+
+    bic_result = _get_bic_set()
+    if bic_result is None:
+        return
+    bic_set, _bic_source_label = bic_result
+
+    df = df.assign(is_bic=df["destination_pincode"].isin(bic_set))
+
+    clients = sorted(df["seller_type"].dropna().astype(str).unique().tolist())
+    if not clients:
+        st.warning("No clients available in the current filter window.")
+        return
+
+    st.caption(
+        "Seller filters live in the **Data & Filters** panel above. The date "
+        "range and granularity below further narrow this page."
+    )
+
+    valid_dates = df["RequestDate"].dropna()
+    if valid_dates.empty:
+        st.warning("No valid Request_created_date values found.")
+        return
+    pin_min, pin_max = valid_dates.min(), valid_dates.max()
+
+    fc1, fc2 = st.columns([2, 1])
+    with fc1:
+        page_date_range = st.date_input(
+            "Date range",
+            value=(pin_min, pin_max),
+            min_value=pin_min, max_value=pin_max,
+            format="DD-MM-YYYY", key="pin_date_range",
+        )
+    with fc2:
+        granularity = st.radio(
+            "Granularity", tuple(GRANULARITY_CONFIG.keys()),
+            horizontal=True, key="pin_granularity",
+        )
+    period_col, label_fn, index_label = GRANULARITY_CONFIG[granularity]
+
+    if isinstance(page_date_range, tuple) and len(page_date_range) == 2:
+        start, end = page_date_range
+        df = df[(df["RequestDate"] >= start) & (df["RequestDate"] <= end)]
+        if df.empty:
+            st.warning("No rows match the selected date range.")
+            return
+
+    c1, c2, c3 = st.columns([2, 1, 1])
+    with c1:
+        client = st.selectbox("Client (seller_type)", clients, key="pin_client")
+    with c2:
+        segment = st.radio(
+            "Pincode segment", ("All", "BIC", "Non-BIC"),
+            horizontal=True, key="pin_segment",
+        )
+    with c3:
+        display_mode = st.radio(
+            "Display values as", ("Counts", "% of row"),
+            horizontal=True, key="pin_display_mode",
+        )
+    as_percent = display_mode == "% of row"
+
+    client_df = df[df["seller_type"].astype(str) == client]
+    if client_df.empty:
+        st.warning(f"No shipments for client `{client}` in the current window.")
+        return
+
+    if segment == "BIC":
+        view_df = client_df[client_df["is_bic"]]
+    elif segment == "Non-BIC":
+        view_df = client_df[~client_df["is_bic"]]
+    else:
+        view_df = client_df
+
+    if view_df.empty:
+        st.warning(
+            f"No shipments for client `{client}` in segment `{segment}` "
+            "match the current filters."
+        )
+        return
+
+    rvp_done = view_df["rvp_pickup_completed_date"].astype("string").str.strip()
+    picked_mask = rvp_done.notna() & (rvp_done != "") & (rvp_done.str.lower() != "nan")
+    picked = int(picked_mask.sum())
+    total = len(view_df)
+    conv_pct = (picked / total * 100) if total else 0.0
+    unique_pins = view_df["destination_pincode"].dropna().nunique()
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Total shipments", f"{total:,}")
+    m2.metric("Picked shipments", f"{picked:,}")
+    m3.metric("Conversion %", f"{conv_pct:.2f}%")
+    m4.metric("Unique pincodes", f"{unique_pins:,}")
+
+    view_sig = _df_signature(view_df)
+
+    st.subheader(
+        f"{granularity}-wise pickup outcome — {client} ({segment}) "
+        "(cumulative D-buckets)"
+    )
+    time_outcome = cached_pivot(view_df, view_sig, period_col,
+                                "PickupOutcome", tuple(OUTCOME_ORDER))
+    time_outcome = cumulate_d_buckets(time_outcome)
+    time_outcome.index = time_outcome.index.map(label_fn)
+    time_outcome.index.name = index_label
+    display_pivot(time_outcome, as_percent)
+
+    # Drop rows where destination_pincode is missing so the index is clean.
+    pin_view = view_df.dropna(subset=["destination_pincode"])
+    pin_view = pin_view[pin_view["destination_pincode"].astype(str) != ""]
+    if pin_view.empty:
+        st.warning("No shipments with a valid destination_pincode in this view.")
+        return
+
+    sig = _df_signature(pin_view)
+
+    st.subheader(
+        f"Pincode-wise pickup outcome — {client} ({segment}) "
+        "(cumulative D-buckets)"
+    )
+
+    top_n = st.number_input(
+        "Show top N pincodes (by volume)", min_value=10, max_value=5000,
+        value=min(100, max(10, unique_pins)), step=10,
+        key="pin_top_n",
+        help="Pincodes are sorted by total shipments. Increase to see more.",
+    )
+
+    pincode_outcome = cached_pivot(
+        pin_view, sig, "destination_pincode", "PickupOutcome",
+        tuple(OUTCOME_ORDER),
+    )
+    pincode_outcome = cumulate_d_buckets(pincode_outcome)
+    # Keep Grand Total at the bottom; sort the body by total volume desc.
+    if "Grand Total" in pincode_outcome.index:
+        gt = pincode_outcome.loc[["Grand Total"]]
+        body = pincode_outcome.drop(index="Grand Total")
+        body = body.sort_values("Grand Total", ascending=False).head(int(top_n))
+        pincode_outcome = pd.concat([body, gt])
+    pincode_outcome.index = pincode_outcome.index.astype(str)
+    pincode_outcome.index.name = "destination_pincode"
+    display_pivot(pincode_outcome, as_percent)
+
+    bic_view = client_df.assign(
+        bic_segment=client_df["is_bic"].map({True: "BIC", False: "Non-BIC"})
+    )
+    bic_sig = _df_signature(bic_view)
+
+    st.subheader(
+        f"BIC vs Non-BIC pickup outcome — {client} (cumulative D-buckets)"
+    )
+    bic_outcome = cached_pivot(bic_view, bic_sig, "bic_segment",
+                               "PickupOutcome", tuple(OUTCOME_ORDER))
+    bic_outcome = cumulate_d_buckets(bic_outcome)
+    bic_outcome.index.name = "BIC segment"
+    display_pivot(bic_outcome, as_percent)
+
+    st.subheader(f"Return-pickup conversion — {client} by BIC segment")
+    conv = conversion_table(bic_view, group_col="bic_segment")
+    conv.index.name = "BIC segment"
+    st.dataframe(conv, use_container_width=True)
+
+    def _build_pincode_workbook() -> bytes:
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+            time_outcome.to_excel(writer, sheet_name=f"{granularity}-wise outcome")
+            pincode_outcome.to_excel(writer, sheet_name="Pincode-wise outcome")
+            bic_outcome.to_excel(writer, sheet_name="BIC vs Non-BIC outcome")
+            conv.to_excel(writer, sheet_name="Conversion by BIC")
+        return buf.getvalue()
+
+    st.download_button(
+        "Download pincode tables as Excel (counts)",
+        data=_build_pincode_workbook(),
+        file_name=(
+            f"rvp_pincode_performance_{client}_{segment}_"
+            f"{granularity.lower()}.xlsx"
+        ),
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+
+# ---------------------------------------------------------------------------
 # Trends page: stitch every snapshot together
 # ---------------------------------------------------------------------------
 
@@ -1011,6 +1456,7 @@ def main() -> None:
     pages = [
         st.Page(render_pickup_page, title="Pickup Performance", default=True),
         st.Page(render_attempt_page, title="Attempt Performance"),
+        st.Page(render_pincode_performance_page, title="Pincode Performance"),
         st.Page(render_trends_page, title="Trends"),
     ]
     try:
