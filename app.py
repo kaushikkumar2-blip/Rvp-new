@@ -45,7 +45,7 @@ REQUIRED_COLS = [
 # Pulled through parsing when present; absent in some legacy files so we don't
 # fail the upload if a column here is missing.
 OPTIONAL_COLS = [
-    "destination_pincode",
+    "src_pincode",
 ]
 
 # Explicit dtypes cut memory ~50% and let pandas skip type inference.
@@ -56,7 +56,7 @@ CSV_DTYPES = {
     "Request_created_date": "string",
     "First_pickup_date": "string",
     "rvp_pickup_completed_date": "string",
-    "destination_pincode": "string",
+    "src_pincode": "string",
 }
 
 
@@ -250,7 +250,7 @@ def load_bic_pincodes(content: bytes) -> frozenset[str]:
 
     Tolerates a few common header spellings (Pincode/pincode/PIN/pin_code).
     Returns stripped strings to match the normalization done in
-    parse_and_enrich for `destination_pincode`.
+    parse_and_enrich for `src_pincode`.
     """
     candidates = ("Pincode", "pincode", "PIN", "pin", "pin_code", "Pin")
     last_err: Optional[Exception] = None
@@ -301,13 +301,13 @@ def parse_and_enrich(content: bytes, filename: str,
     df["First_pickup_date"] = pd.to_datetime(
         df["First_pickup_date"], errors="coerce", dayfirst=True
     )
-    if "destination_pincode" in df.columns:
+    if "src_pincode" in df.columns:
         # Pincodes can arrive as int, float, or string with whitespace; coerce
         # to a clean string so set-membership checks against the BIC list work.
-        pin = df["destination_pincode"].astype("string").str.strip()
+        pin = df["src_pincode"].astype("string").str.strip()
         # Drop a trailing ".0" left over when pandas reads ints via float.
         pin = pin.str.replace(r"\.0$", "", regex=True)
-        df["destination_pincode"] = pin
+        df["src_pincode"] = pin
     bucket, _ = compute_attempt(df)
     df = df.assign(
         AttemptBucket=bucket,
@@ -1043,10 +1043,10 @@ def render_pincode_performance_page() -> None:
     if df is None:
         return
 
-    if "destination_pincode" not in df.columns:
+    if "src_pincode" not in df.columns:
         st.warning(
             "The uploaded shipment file does not contain a "
-            "`destination_pincode` column, so pincode performance cannot be "
+            "`src_pincode` column, so pincode performance cannot be "
             "computed. Re-upload a file that includes it."
         )
         return
@@ -1056,7 +1056,7 @@ def render_pincode_performance_page() -> None:
         return
     bic_set, _bic_source_label = bic_result
 
-    df = df.assign(is_bic=df["destination_pincode"].isin(bic_set))
+    df = df.assign(is_bic=df["src_pincode"].isin(bic_set))
 
     clients = sorted(df["seller_type"].dropna().astype(str).unique().tolist())
     if not clients:
@@ -1135,7 +1135,7 @@ def render_pincode_performance_page() -> None:
     picked = int(picked_mask.sum())
     total = len(view_df)
     conv_pct = (picked / total * 100) if total else 0.0
-    unique_pins = view_df["destination_pincode"].dropna().nunique()
+    unique_pins = view_df["src_pincode"].dropna().nunique()
 
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Total shipments", f"{total:,}")
@@ -1156,11 +1156,11 @@ def render_pincode_performance_page() -> None:
     time_outcome.index.name = index_label
     display_pivot(time_outcome, as_percent)
 
-    # Drop rows where destination_pincode is missing so the index is clean.
-    pin_view = view_df.dropna(subset=["destination_pincode"])
-    pin_view = pin_view[pin_view["destination_pincode"].astype(str) != ""]
+    # Drop rows where src_pincode is missing so the index is clean.
+    pin_view = view_df.dropna(subset=["src_pincode"])
+    pin_view = pin_view[pin_view["src_pincode"].astype(str) != ""]
     if pin_view.empty:
-        st.warning("No shipments with a valid destination_pincode in this view.")
+        st.warning("No shipments with a valid src_pincode in this view.")
         return
 
     sig = _df_signature(pin_view)
@@ -1178,7 +1178,7 @@ def render_pincode_performance_page() -> None:
     )
 
     pincode_outcome = cached_pivot(
-        pin_view, sig, "destination_pincode", "PickupOutcome",
+        pin_view, sig, "src_pincode", "PickupOutcome",
         tuple(OUTCOME_ORDER),
     )
     pincode_outcome = cumulate_d_buckets(pincode_outcome)
@@ -1189,7 +1189,7 @@ def render_pincode_performance_page() -> None:
         body = body.sort_values("Grand Total", ascending=False).head(int(top_n))
         pincode_outcome = pd.concat([body, gt])
     pincode_outcome.index = pincode_outcome.index.astype(str)
-    pincode_outcome.index.name = "destination_pincode"
+    pincode_outcome.index.name = "src_pincode"
     display_pivot(pincode_outcome, as_percent)
 
     bic_view = client_df.assign(
