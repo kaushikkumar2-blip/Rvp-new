@@ -1,0 +1,8 @@
+[server]
+# Max upload size in MB (default 200). Bumped so we can accept larger
+# shipment-level CSV exports.
+maxUploadSize = 1024
+
+# Also raise the per-request body size so multipart uploads don't get
+# rejected by the websocket layer (default 200 MB, matched here).
+maxMessageSize = 1024
