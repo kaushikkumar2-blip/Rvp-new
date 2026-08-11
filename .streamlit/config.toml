@@ -6,3 +6,13 @@ maxUploadSize = 1024
 # Also raise the per-request body size so multipart uploads don't get
 # rejected by the websocket layer (default 200 MB, matched here).
 maxMessageSize = 1024
+
+[theme]
+base = "light"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F8F9FA"
+textColor = "#31333F"
+primaryColor = "#4a90d9"
+
+[client]
+toolbarMode = "minimal"

@@ -6,17 +6,29 @@ Upload supports `.xlsx`, `.xls`, and `.csv`.
 
 ## Pages
 
-- **Pickup Performance** (default) — day/week/month and seller-type-wise outcome breakdown. Converted shipments split into `D0..D4+`; the rest bucketed as `Pending / QC failed / Not Attempted`. Conversion % by seller type below.
-- **Attempt Performance** — day/week/month and seller-type attempt buckets (`D0..D4+, Not Attempted`).
-- **Trends** — stitched view across every saved snapshot. Line charts + underlying tables for outcome %, attempt %, and conversion-by-seller %.
+- **Pickup Performance** — summarised pickup outcome buckets + conversion % for the selected date range and seller.
+- **Attempt Performance** — summarised attempt buckets for the same filters.
 
-Both analytical pages have a `Counts` / `% of row` toggle (Upload mode only; snapshot mode is % only because that's what's stored).
+Both pages share **Date range** and **seller_type** (`All` or one seller) filters at the top.
 
 ## Run locally
 
 ```bash
 pip install -r requirements.txt
 streamlit run app.py
+```
+
+### Default dataset
+
+On startup the dashboard loads any `.csv` from `data/` (prefers `data/default.csv` if present). Your file `3e77de04ce5192e2ef5930758dec56ba.csv` is a **pre-aggregated daily export** (`seller_type`, `day`, `pickup_*`, `attempt_*` columns) — Pickup and Attempt pages work out of the box. Pincode Performance still needs a raw shipment export with `src_pincode`.
+
+Uploading a file replaces the default for that session; **Clear** switches back.
+
+Override the path in `.streamlit/secrets.toml`:
+
+```toml
+[default_data]
+path = "path/to/your/export.csv"
 ```
 
 ## Data sources (top of each page)

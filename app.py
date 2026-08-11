@@ -17,6 +17,7 @@ from __future__ import annotations
 import hashlib
 import io
 from datetime import timedelta
+from pathlib import Path
 from typing import Optional, Tuple
 
 import pandas as pd
@@ -24,6 +25,28 @@ import streamlit as st
 
 import github_store as ghs
 
+APP_DIR = Path(__file__).resolve().parent
+DATA_DIR = APP_DIR / "data"
+DEFAULT_CSV_PATH = DATA_DIR / "default.csv"
+
+AGG_OUTCOME_COUNT = {
+    "D0": "pickup_d0",
+    "D1": "pickup_d1_cum",
+    "D2": "pickup_d2_cum",
+    "D3": "pickup_d3_cum",
+    "D4+": "pickup_d4plus_cum",
+    "Pending": "pickup_pending",
+    "QC failed": "pickup_qc_failed",
+    "Not Attempted": "pickup_not_attempted",
+}
+AGG_ATTEMPT_COUNT = {
+    "D0": "attempt_d0",
+    "D1": "attempt_d1_cum",
+    "D2": "attempt_d2_cum",
+    "D3": "attempt_d3_cum",
+    "D4+": "attempt_d4plus_cum",
+    "Not Attempted": "attempt_not_attempted",
+}
 DEFAULT_SHEET = "Externalization_RVP_report_ship"
 ATTEMPT_ORDER = ["D0", "D1", "D2", "D3", "D4+", "Not Attempted"]
 OUTCOME_ORDER = [
@@ -31,7 +54,7 @@ OUTCOME_ORDER = [
     "Pending", "QC failed", "Not Attempted",
 ]
 QC_REASONS = {"PRODUCT_DAMAGED", "PRODUCT_MISMATCH", "PRODUCT_MISMATCHED"}
-DATE_FMT = "%d-%m-%Y"
+DATE_FMT = "%Y-%m-%d"
 
 REQUIRED_COLS = [
     "vendor_tracking_id",
@@ -357,13 +380,15 @@ def cached_conversion(_df: pd.DataFrame, sig: str) -> pd.DataFrame:
 def _week_label(value) -> str:
     if hasattr(value, "strftime"):
         end = value + timedelta(days=6)
-        return f"{value.strftime(DATE_FMT)} to {end.strftime(DATE_FMT)}"
+        wk = pd.Timestamp(value).isocalendar().week
+        return f"W{wk:02d} · {value.strftime(DATE_FMT)} to {end.strftime(DATE_FMT)}"
     return str(value)
 
 
 def _month_label(value) -> str:
     if hasattr(value, "strftime"):
-        return value.strftime("%b %Y")
+        ts = pd.Timestamp(value)
+        return f"M{ts.month:02d} · {ts.strftime('%Y-%m')}"
     return str(value)
 
 
@@ -435,13 +460,200 @@ def build_pickup_workbook(day_outcome, seller_outcome, conv_table,
 
 
 # ---------------------------------------------------------------------------
+# Default dataset (bundled CSV)
+# ---------------------------------------------------------------------------
+
+def _resolve_default_csv_path() -> Optional[Path]:
+    """Return the default shipment CSV path, if configured and present."""
+    try:
+        configured = st.secrets.get("default_data", {}).get("path")
+    except (KeyError, FileNotFoundError):
+        configured = None
+    if configured:
+        path = Path(configured)
+        if not path.is_absolute():
+            path = APP_DIR / path
+        return path if path.is_file() else None
+    if DEFAULT_CSV_PATH.is_file():
+        return DEFAULT_CSV_PATH
+    csvs = sorted(DATA_DIR.glob("*.csv"), key=lambda p: p.stat().st_mtime, reverse=True)
+    return csvs[0] if csvs else None
+
+
+@st.cache_data(show_spinner=False)
+def _read_default_csv(path_str: str, mtime_ns: int) -> bytes:
+    del mtime_ns  # cache bust when the file changes on disk
+    return Path(path_str).read_bytes()
+
+
+def _default_dataset() -> Optional[Tuple[bytes, str, Path]]:
+    """Load bundled default CSV bytes. Cached by path mtime."""
+    path = _resolve_default_csv_path()
+    if path is None:
+        return None
+    content = _read_default_csv(str(path), path.stat().st_mtime_ns)
+    return content, path.name, path
+
+
+def is_aggregated_shipment_csv(columns) -> bool:
+    cols = set(columns)
+    return (
+        "total_shipments" in cols
+        and "pickup_d0" in cols
+        and "vendor_tracking_id" not in cols
+    )
+
+
+def sniff_data_format(content: bytes, filename: str) -> str:
+    if not is_csv(filename):
+        return "raw"
+    head = pd.read_csv(io.BytesIO(content), nrows=0)
+    return "aggregated" if is_aggregated_shipment_csv(head.columns) else "raw"
+
+
+def _parse_aggregated_day(series: pd.Series) -> pd.Series:
+    """ISO (2026-07-08) or legacy DD-MM-YYYY."""
+    parsed = pd.to_datetime(series, errors="coerce", format="ISO8601")
+    if parsed.notna().sum() < max(1, len(series) // 2):
+        parsed = parsed.fillna(pd.to_datetime(series, errors="coerce", dayfirst=True))
+    return parsed
+
+
+@st.cache_data(show_spinner="Reading aggregated CSV...", max_entries=4)
+def parse_aggregated_csv(content: bytes) -> pd.DataFrame:
+    df = pd.read_csv(io.BytesIO(content))
+    day = _parse_aggregated_day(df["day"])
+    df = df.assign(
+        day=day,
+        RequestDate=day.dt.date,
+        WeekStart=day.dt.to_period("W").dt.start_time.dt.date,
+        MonthStart=day.dt.to_period("M").dt.start_time.dt.date,
+        seller_type=df["seller_type"].astype(str),
+    )
+    return df
+
+
+def pickup_sum_cols(df: pd.DataFrame) -> list[str]:
+    """Count columns for pickup view — follows CSV column order."""
+    cols: list[str] = []
+    if "total_shipments" in df.columns:
+        cols.append("total_shipments")
+    for c in df.columns:
+        if c in cols or c.endswith("_pct"):
+            continue
+        if c.startswith("pickup_") or c.startswith("cancelled"):
+            cols.append(c)
+    return cols
+
+
+def attempt_sum_cols(df: pd.DataFrame) -> list[str]:
+    """Count columns for attempt view — follows CSV column order."""
+    cols: list[str] = []
+    if "total_shipments" in df.columns:
+        cols.append("total_shipments")
+    for c in df.columns:
+        if c in cols or c.endswith("_pct"):
+            continue
+        if c.startswith("attempt_") or c.startswith("cancelled"):
+            cols.append(c)
+    return cols
+
+
+def _agg_sum_pivot(
+    df: pd.DataFrame,
+    index_col: str,
+    col_map: dict[str, str],
+    order: list[str],
+) -> pd.DataFrame:
+    grouped = df.groupby(index_col, dropna=False)[list(col_map.values())].sum()
+    grouped = grouped.rename(columns={v: k for k, v in col_map.items()})
+    for bucket in order:
+        if bucket not in grouped.columns:
+            grouped[bucket] = 0
+    grouped = grouped[order]
+    grouped["Grand Total"] = grouped.sum(axis=1)
+    grouped.loc["Grand Total"] = grouped.sum(axis=0)
+    return grouped.astype(int)
+
+
+def _agg_conversion_table(df: pd.DataFrame) -> pd.DataFrame:
+    agg = df.groupby("seller_type", dropna=False).agg(
+        **{
+            "Total Shipments": ("total_shipments", "sum"),
+            "Picked Shipments": ("pickup_d4plus_cum", "sum"),
+        }
+    )
+    agg["Conversion %"] = (
+        agg["Picked Shipments"] / agg["Total Shipments"] * 100
+    ).round(2)
+    agg.loc["Grand Total"] = [
+        int(agg["Total Shipments"].sum()),
+        int(agg["Picked Shipments"].sum()),
+        round(
+            agg["Picked Shipments"].sum()
+            / max(agg["Total Shipments"].sum(), 1)
+            * 100,
+            2,
+        ),
+    ]
+    agg["Total Shipments"] = agg["Total Shipments"].astype(int)
+    agg["Picked Shipments"] = agg["Picked Shipments"].astype(int)
+    return agg
+
+
+def _apply_filters_agg(df_full: pd.DataFrame) -> Optional[pd.DataFrame]:
+    valid_dates = df_full["RequestDate"].dropna()
+    if valid_dates.empty:
+        st.warning("No valid day values found in the aggregated CSV.")
+        return None
+
+    min_date, max_date = valid_dates.min(), valid_dates.max()
+    seller_options = sorted(df_full["seller_type"].dropna().astype(str).unique().tolist())
+
+    date_col, seller_col = st.columns([1, 1])
+    with date_col:
+        date_range = st.date_input(
+            "day",
+            value=(min_date, max_date),
+            min_value=min_date,
+            max_value=max_date,
+            format="YYYY-MM-DD",
+            key="agg_date_range",
+        )
+    with seller_col:
+        selected_sellers = st.multiselect(
+            "seller_type",
+            options=seller_options,
+            default=seller_options,
+            placeholder="All seller types",
+            key="agg_seller_filter",
+        )
+
+    df = df_full
+    if isinstance(date_range, tuple) and len(date_range) == 2:
+        start, end = date_range
+        df = df[(df["RequestDate"] >= start) & (df["RequestDate"] <= end)]
+    if not selected_sellers:
+        st.warning("Select at least one seller_type.")
+        return None
+    if len(selected_sellers) != len(seller_options):
+        df = df[df["seller_type"].isin(selected_sellers)]
+    if df.empty:
+        st.warning("No rows match the selected filters.")
+        return None
+    return df
+
+
+# ---------------------------------------------------------------------------
 # Sidebar: source picker (Upload / GitHub snapshot)
 # ---------------------------------------------------------------------------
 
-def _render_upload_source() -> Optional[pd.DataFrame]:
+def _render_upload_source() -> tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]:
+    """Return (raw_df, agg_df); exactly one may be set."""
     uploaded = st.file_uploader(
         "Upload raw file (.xlsx, .xls, or .csv)",
         type=["xlsx", "xls", "csv"], key="uploader",
+        help="Optional — replaces the CSV loaded from the data/ folder.",
     )
     if uploaded is not None:
         st.session_state["_file_bytes"] = uploaded.getvalue()
@@ -449,16 +661,35 @@ def _render_upload_source() -> Optional[pd.DataFrame]:
 
     content = st.session_state.get("_file_bytes")
     filename = st.session_state.get("_file_name")
-    if content is None or filename is None:
-        st.info("Upload a file to get started.")
-        return None
+    default_path: Optional[Path] = None
+    using_upload = content is not None and filename is not None
+
+    if not using_upload:
+        default = _default_dataset()
+        if default is None:
+            hint = "`data/` (any `.csv`; `default.csv` preferred)"
+            try:
+                if st.secrets.get("default_data", {}).get("path"):
+                    hint = f"`{st.secrets['default_data']['path']}` (from secrets)"
+            except (KeyError, FileNotFoundError):
+                pass
+            st.info(f"Upload a file to get started, or place a CSV at {hint}.")
+            return None, None
+        content, filename, default_path = default
 
     info_col, clear_col = st.columns([6, 1])
-    info_col.caption(f"Using `{filename}` ({len(content) / 1024:.0f} KB)")
-    if clear_col.button("Clear", help="Remove the uploaded file"):
-        st.session_state.pop("_file_bytes", None)
-        st.session_state.pop("_file_name", None)
-        st.rerun()
+    if using_upload:
+        info_col.caption(f"Using `{filename}` ({len(content) / 1024:.0f} KB)")
+        if clear_col.button("Clear", help="Remove the uploaded file and use default CSV"):
+            st.session_state.pop("_file_bytes", None)
+            st.session_state.pop("_file_name", None)
+            st.rerun()
+    else:
+        rel = default_path.relative_to(APP_DIR) if default_path else DEFAULT_CSV_PATH
+        info_col.caption(
+            f"Default dataset: `{rel}` ({len(content) / 1024:.0f} KB). "
+            "Upload a file above to replace it."
+        )
 
     sheet_name = None
     if not is_csv(filename):
@@ -466,20 +697,32 @@ def _render_upload_source() -> Optional[pd.DataFrame]:
             sheets = list_sheets(content)
         except Exception as exc:
             st.error(f"Could not read workbook: {exc}")
-            return None
+            return None, None
         default_idx = sheets.index(DEFAULT_SHEET) if DEFAULT_SHEET in sheets else 0
         sheet_name = st.selectbox("Sheet", sheets, index=default_idx, key="sheet")
+
+    if sniff_data_format(content, filename) == "aggregated":
+        try:
+            df_full = parse_aggregated_csv(content)
+        except Exception as exc:
+            st.error(f"Could not parse aggregated CSV: {exc}")
+            return None, None
+        st.caption(
+            "Pre-aggregated daily export — counts are summed across sellers "
+            "for day/week/month views."
+        )
+        return None, _apply_filters_agg(df_full)
 
     try:
         df_full = parse_and_enrich(content, filename, sheet_name)
     except ValueError as exc:
         st.error(str(exc))
-        return None
+        return None, None
     except Exception as exc:
         st.error(f"Could not parse file: {exc}")
-        return None
+        return None, None
 
-    return _apply_filters(df_full)
+    return _apply_filters(df_full), None
 
 
 def _apply_filters(df_full: pd.DataFrame) -> Optional[pd.DataFrame]:
@@ -497,7 +740,7 @@ def _apply_filters(df_full: pd.DataFrame) -> Optional[pd.DataFrame]:
             "Request_created_date",
             value=(min_date, max_date),
             min_value=min_date, max_value=max_date,
-            format="DD-MM-YYYY", key="date_range",
+            format="YYYY-MM-DD", key="date_range",
         )
     with seller_col:
         selected_sellers = st.multiselect(
@@ -647,8 +890,8 @@ def _render_github_load_source() -> Optional[dict[str, pd.DataFrame]]:
 # Page renderers
 # ---------------------------------------------------------------------------
 
-def _source_picker() -> tuple[str, Optional[pd.DataFrame], Optional[dict]]:
-    """Top-of-page source selector. Returns (mode, df, snapshot_tables)."""
+def _source_picker() -> tuple[str, Optional[pd.DataFrame], Optional[pd.DataFrame], Optional[dict]]:
+    """Top-of-page source selector. Returns (mode, raw_df, agg_df, snapshot_tables)."""
     with st.expander("Data & Filters", expanded=True):
         modes = ["Upload new file"]
         if ghs.is_configured():
@@ -656,13 +899,13 @@ def _source_picker() -> tuple[str, Optional[pd.DataFrame], Optional[dict]]:
         mode = st.radio("Source", modes, horizontal=True, key="source_mode")
 
         if mode == "Upload new file":
-            df = _render_upload_source()
-            if df is not None:
-                _render_github_save_section(df)
-            return mode, df, None
+            raw_df, agg_df = _render_upload_source()
+            if raw_df is not None:
+                _render_github_save_section(raw_df)
+            return mode, raw_df, agg_df, None
         else:
             tables = _render_github_load_source()
-            return mode, None, tables
+            return mode, None, None, tables
 
 
 def _repair_snapshot_table(t: pd.DataFrame, table_name: str) -> pd.DataFrame:
@@ -720,121 +963,79 @@ def _render_loaded_snapshot(tables: dict[str, pd.DataFrame], page: str) -> None:
             st.warning(f"Snapshot is missing `{att_key}`.")
 
 
-def render_pickup_page() -> None:
-    st.title("Pickup Performance")
-    st.caption(
-        "D0..D4+ are **cumulative**: D1 includes D0, D2 includes D0-D1, etc. "
-        "D4+ equals the total converted shipments per row. "
-        "Pending = attempted but not yet picked up and not QC-failed."
-    )
-
-    mode, df, snap = _source_picker()
-
-    if mode == "Load from GitHub":
-        if snap is None:
-            return
-        _render_loaded_snapshot(snap, page="pickup")
-        return
-
-    if df is None:
-        return
-
-    sig = _df_signature(df)
-
+def _render_agg_pickup_page(df: pd.DataFrame) -> None:
     ctrl_col1, ctrl_col2 = st.columns([1, 1])
     with ctrl_col1:
         granularity = st.radio(
             "Granularity", tuple(GRANULARITY_CONFIG.keys()),
-            horizontal=True, key="pickup_granularity",
+            horizontal=True, key="agg_pickup_granularity",
         )
     with ctrl_col2:
         display_mode = st.radio(
             "Display values as", ("Counts", "% of row"),
-            horizontal=True, key="pickup_display_mode",
+            horizontal=True, key="agg_pickup_display_mode",
         )
     as_percent = display_mode == "% of row"
     period_col, label_fn, index_label = GRANULARITY_CONFIG[granularity]
 
     st.subheader(f"{granularity}-wise pickup outcome (cumulative D-buckets)")
-    day_outcome = cached_pivot(df, sig, period_col, "PickupOutcome", tuple(OUTCOME_ORDER))
-    day_outcome = cumulate_d_buckets(day_outcome)
+    day_outcome = _agg_sum_pivot(df, period_col, AGG_OUTCOME_COUNT, OUTCOME_ORDER)
     day_outcome.index = day_outcome.index.map(label_fn)
     day_outcome.index.name = index_label
     display_pivot(day_outcome, as_percent)
 
     st.subheader("Seller-type-wise pickup outcome (cumulative D-buckets)")
-    seller_outcome = cached_pivot(df, sig, "seller_type", "PickupOutcome", tuple(OUTCOME_ORDER))
-    seller_outcome = cumulate_d_buckets(seller_outcome)
+    seller_outcome = _agg_sum_pivot(df, "seller_type", AGG_OUTCOME_COUNT, OUTCOME_ORDER)
     seller_outcome.index.name = "seller_type"
     display_pivot(seller_outcome, as_percent)
 
     st.subheader("Return-pickup conversion by seller type")
-    conv = cached_conversion(df, sig)
+    conv = _agg_conversion_table(df)
     conv.index.name = "seller_type"
     st.dataframe(conv, use_container_width=True)
 
-    st.download_button(
-        "Download pickup tables as Excel (counts)",
-        data=build_pickup_workbook(day_outcome, seller_outcome, conv, granularity),
-        file_name=f"rvp_pickup_performance_{granularity.lower()}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
 
-
-def render_attempt_page() -> None:
-    st.title("Attempt Performance")
-    st.caption(
-        "D0..D4+ are **cumulative**: D1 includes D0, D2 includes D0-D1, etc. "
-        "D4+ equals the total attempted shipments per row. "
-        "QC-failed shipments are excluded here; see the Pickup Performance page."
-    )
-
-    mode, df, snap = _source_picker()
-
-    if mode == "Load from GitHub":
-        if snap is None:
-            return
-        _render_loaded_snapshot(snap, page="attempt")
-        return
-
-    if df is None:
-        return
-
-    sig = _df_signature(df)
-
+def _render_agg_attempt_page(df: pd.DataFrame) -> None:
     ctrl_col1, ctrl_col2 = st.columns([1, 1])
     with ctrl_col1:
         granularity = st.radio(
             "Granularity", tuple(GRANULARITY_CONFIG.keys()),
-            horizontal=True, key="attempt_granularity",
+            horizontal=True, key="agg_attempt_granularity",
         )
     with ctrl_col2:
         display_mode = st.radio(
             "Display values as", ("Counts", "% of row"),
-            horizontal=True, key="attempt_display_mode",
+            horizontal=True, key="agg_attempt_display_mode",
         )
     as_percent = display_mode == "% of row"
     period_col, label_fn, index_label = GRANULARITY_CONFIG[granularity]
 
     st.subheader(f"{granularity}-wise attempt pivot (cumulative D-buckets)")
-    day_pivot = cached_pivot(df, sig, period_col, "AttemptBucket", tuple(ATTEMPT_ORDER))
-    day_pivot = cumulate_d_buckets(day_pivot)
+    day_pivot = _agg_sum_pivot(df, period_col, AGG_ATTEMPT_COUNT, ATTEMPT_ORDER)
     day_pivot.index = day_pivot.index.map(label_fn)
     day_pivot.index.name = index_label
     display_pivot(day_pivot, as_percent)
 
     st.subheader("Seller-type-wise attempt pivot (cumulative D-buckets)")
-    seller_pivot = cached_pivot(df, sig, "seller_type", "AttemptBucket", tuple(ATTEMPT_ORDER))
-    seller_pivot = cumulate_d_buckets(seller_pivot)
+    seller_pivot = _agg_sum_pivot(df, "seller_type", AGG_ATTEMPT_COUNT, ATTEMPT_ORDER)
     seller_pivot.index.name = "seller_type"
     display_pivot(seller_pivot, as_percent)
 
-    st.download_button(
-        "Download attempt tables as Excel (counts)",
-        data=build_attempt_workbook(day_pivot, seller_pivot, granularity),
-        file_name=f"rvp_attempt_performance_{granularity.lower()}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
+
+def render_pickup_page() -> None:
+    render_seller_summary_page("pickup")
+
+
+def render_attempt_page() -> None:
+    render_seller_summary_page("attempt")
+
+
+def render_pickup_period_page() -> None:
+    render_period_detail_page("pickup")
+
+
+def render_attempt_period_page() -> None:
+    render_period_detail_page("attempt")
 
 
 # ---------------------------------------------------------------------------
@@ -1032,11 +1233,18 @@ def render_pincode_performance_page() -> None:
         "D0..D4+ are cumulative — D2 includes D0-D1, etc."
     )
 
-    mode, df, _snap = _source_picker()
+    mode, df, agg_df, _snap = _source_picker()
     if mode == "Load from GitHub":
         st.info(
             "Pincode Performance needs raw shipment rows. Switch the source "
             "above to **Upload new file** to use this page."
+        )
+        return
+
+    if agg_df is not None:
+        st.info(
+            "Pincode Performance needs raw shipment rows with `src_pincode`. "
+            "Upload a raw RVP export to use this page."
         )
         return
 
@@ -1080,7 +1288,7 @@ def render_pincode_performance_page() -> None:
             "Date range",
             value=(pin_min, pin_max),
             min_value=pin_min, max_value=pin_max,
-            format="DD-MM-YYYY", key="pin_date_range",
+            format="YYYY-MM-DD", key="pin_date_range",
         )
     with fc2:
         granularity = st.radio(
@@ -1447,6 +1655,559 @@ def render_trends_page() -> None:
     )
 
 
+def _load_simple_table_data() -> tuple[Optional[pd.DataFrame], str]:
+    """Load aggregated CSV from session upload (if any) or data/ folder."""
+    content = st.session_state.get("_file_bytes")
+    filename = st.session_state.get("_file_name")
+    if content is not None and filename is not None:
+        source = filename
+    else:
+        default = _default_dataset()
+        if default is None:
+            return None, ""
+        content, filename, path = default
+        source = str(path.relative_to(APP_DIR))
+
+    if sniff_data_format(content, filename) != "aggregated":
+        st.error(
+            "This view needs the aggregated CSV format "
+            "(seller_type, day, total_shipments, pickup_*, attempt_*)."
+        )
+        return None, source
+
+    try:
+        return parse_aggregated_csv(content), source
+    except Exception as exc:
+        st.error(f"Could not read CSV: {exc}")
+        return None, source
+
+
+def summarize_metrics(
+    df: pd.DataFrame,
+    start,
+    end,
+    sum_cols: list[str],
+    include_grand_total: bool,
+    as_percent: bool = False,
+    conversion_col: Optional[str] = None,
+) -> pd.DataFrame:
+    """One row per seller_type with counts summed over the selected period."""
+    sum_cols = [c for c in sum_cols if c in df.columns]
+    if not sum_cols:
+        raise ValueError("No metric columns found in the data.")
+
+    grouped = df.groupby("seller_type", as_index=False)[sum_cols].sum()
+    range_label = f"{format_date(start)} to {format_date(end)}"
+    grouped.insert(0, "date_range", range_label)
+
+    if include_grand_total and len(grouped) > 1:
+        totals = grouped[sum_cols].sum()
+        gt_row: dict = {
+            "date_range": range_label,
+            "seller_type": "Grand Total",
+            **totals.to_dict(),
+        }
+        grouped = pd.concat([grouped, pd.DataFrame([gt_row])], ignore_index=True)
+
+    if as_percent:
+        out = grouped[["date_range", "seller_type", "total_shipments"]].copy()
+        ts = grouped["total_shipments"].replace(0, pd.NA)
+        for col in sum_cols:
+            if col == "total_shipments":
+                continue
+            out[col] = (grouped[col] / ts * 100).round(1)
+        if conversion_col:
+            out["Conversion %"] = (grouped[conversion_col] / ts * 100).round(2)
+        return out
+
+    return grouped[["date_range", "seller_type"] + sum_cols]
+
+
+# ---------------------------------------------------------------------------
+# Report UI (seller summary + period drill-down)
+# ---------------------------------------------------------------------------
+
+_DASHBOARD_CSS = """
+<style>
+.kpi-row { display:flex; gap:12px; margin:0 0 1rem; flex-wrap:wrap; }
+.kpi-card {
+  flex:1; min-width:150px; background:#fff; border-radius:8px;
+  padding:14px 16px; border-top:4px solid #ccc;
+  box-shadow:0 1px 3px rgba(0,0,0,.08);
+}
+.kpi-card h4 { margin:0; font-size:.72rem; color:#666; text-transform:uppercase; letter-spacing:.03em; }
+.kpi-card .val { font-size:1.55rem; font-weight:700; margin:4px 0 2px; line-height:1.2; }
+.kpi-card .sub { font-size:.68rem; color:#888; margin:0; }
+.legend-box { font-size:.78rem; color:#555; margin:.25rem 0 .75rem; }
+</style>
+"""
+
+_PICKUP_PCT_METRICS = [
+    ("D0 %", "pickup_d0"),
+    ("D1 cum %", "pickup_d1_cum"),
+    ("D2 cum %", "pickup_d2_cum"),
+    ("QC Failed %", "pickup_qc_failed"),
+    ("Not Attempted %", "pickup_not_attempted"),
+    ("Conversion %", "pickup_d4plus_cum"),
+    ("Cancelled %", "cancelled"),
+    ("Cancelled D2 cum %", "cancelled_d2_cum"),
+    ("Cancelled D2 %", "cancelled_d2"),  # legacy column name
+]
+_ATTEMPT_PCT_METRICS = [
+    ("Attempt D0 %", "attempt_d0"),
+    ("Attempt D1 cum %", "attempt_d1_cum"),
+    ("Attempt D2 cum %", "attempt_d2_cum"),
+    ("Attempt QC Failed %", "attempt_qc_failed"),
+    ("Attempt Not Attempted %", "attempt_not_attempted"),
+    ("Cancelled %", "cancelled"),
+    ("Cancelled D2 cum %", "cancelled_d2_cum"),
+    ("Cancelled D2 %", "cancelled_d2"),  # legacy column name
+]
+
+
+def _inject_dashboard_css() -> None:
+    st.markdown(_DASHBOARD_CSS, unsafe_allow_html=True)
+
+
+def _pct_metrics_for_df(df: pd.DataFrame, specs: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    return [(label, col) for label, col in specs if col in df.columns]
+
+
+def _week_label_bounded(week_start, range_start, range_end) -> str:
+    week_end = week_start + timedelta(days=6)
+    label = _week_label(week_start)
+    if range_start > week_start or range_end < week_end:
+        actual_s = max(week_start, range_start)
+        actual_e = min(week_end, range_end)
+        label += f" ({format_date(actual_s)} to {format_date(actual_e)})"
+    return label
+
+
+def _month_label_bounded(month_start, range_start, range_end) -> str:
+    month_end = (pd.Timestamp(month_start) + pd.offsets.MonthEnd(0)).date()
+    label = _month_label(month_start)
+    if range_start > month_start or range_end < month_end:
+        actual_s = max(month_start, range_start)
+        actual_e = min(month_end, range_end)
+        label += f" ({format_date(actual_s)} to {format_date(actual_e)})"
+    return label
+
+
+def _metrics_from_sums(sums: dict[str, float], pct_specs: list[tuple[str, str]]) -> dict:
+    vol = sums.get("total_shipments", 0) or 0
+    row: dict = {"Volume": int(vol)}
+    for label, col in pct_specs:
+        num = sums.get(col, 0) or 0
+        row[label] = round(num / vol * 100, 2) if vol else 0.0
+    return row
+
+
+def _order_metric_labels(labels: list[str]) -> list[str]:
+    """Bucket metrics first; Conversion + Cancelled always last."""
+    trailing = [l for l in labels if "Conversion" in l or "Cancelled" in l]
+    leading = [l for l in labels if l not in trailing]
+    return leading + trailing
+
+
+def _build_seller_summary(
+    view: pd.DataFrame, sum_cols: list[str], pct_specs: list[tuple[str, str]],
+) -> pd.DataFrame:
+    rows = []
+    for seller, grp in view.groupby("seller_type", sort=True):
+        sums = {c: grp[c].sum() for c in sum_cols if c in grp.columns}
+        row = _metrics_from_sums(sums, pct_specs)
+        row["Seller"] = str(seller)
+        rows.append(row)
+    if not rows:
+        return pd.DataFrame()
+    out = pd.DataFrame(rows)
+    metric_labels = _order_metric_labels([label for label, _ in pct_specs])
+    cols = ["Seller", "Volume"] + metric_labels
+    return out[cols].sort_values("Volume", ascending=False)
+
+
+def _build_period_detail(
+    view: pd.DataFrame,
+    range_start,
+    range_end,
+    sum_cols: list[str],
+    pct_specs: list[tuple[str, str]],
+    granularity: str,
+) -> pd.DataFrame:
+    if granularity == "Daily":
+        period_col = "RequestDate"
+        label_fn = lambda k, _: format_date(k)  # noqa: E731
+    elif granularity == "Weekly":
+        period_col = "WeekStart"
+        label_fn = lambda k, _: _week_label_bounded(k, range_start, range_end)  # noqa: E731
+    else:
+        period_col = "MonthStart"
+        label_fn = lambda k, _: _month_label_bounded(k, range_start, range_end)  # noqa: E731
+
+    rows = []
+    for (period_key, seller), grp in view.groupby([period_col, "seller_type"], sort=True):
+        sums = {c: grp[c].sum() for c in sum_cols if c in grp.columns}
+        row = _metrics_from_sums(sums, pct_specs)
+        row["Period"] = label_fn(period_key, grp)
+        row["Seller"] = str(seller)
+        row["_period_sort"] = pd.Timestamp(period_key)
+        rows.append(row)
+
+    if not rows:
+        return pd.DataFrame()
+    out = pd.DataFrame(rows)
+    metric_labels = _order_metric_labels([label for label, _ in pct_specs])
+    cols = ["Period", "Seller", "Volume"] + metric_labels
+    return out.sort_values(["_period_sort", "Seller"]).drop(columns="_period_sort")[cols]
+
+
+def _pct_cell_style(val, col: str) -> str:
+    if pd.isna(val):
+        return ""
+    higher_better = col in (
+        "Conversion %", "D0 %", "D1 cum %", "D2 cum %",
+        "Attempt D0 %", "Attempt D1 cum %", "Attempt D2 cum %",
+    )
+    if higher_better:
+        if val >= 70:
+            return "background-color:#d4edda;color:#155724"
+        if val >= 50:
+            return "background-color:#fff3cd;color:#856404"
+        return "background-color:#f8d7da;color:#721c24"
+    if val <= 5:
+        return "background-color:#d4edda;color:#155724"
+    if val <= 10:
+        return "background-color:#fff3cd;color:#856404"
+    return "background-color:#f8d7da;color:#721c24"
+
+
+def _style_report_table(df: pd.DataFrame, pct_cols: list[str]):
+    fmt = {"Volume": "{:,}"}
+    fmt.update({c: "{:.2f}%" for c in pct_cols if c in df.columns})
+
+    def _row_style(row):
+        return [_pct_cell_style(row[col], col) if col in pct_cols else "" for col in row.index]
+
+    return df.style.format(fmt, na_rep="-").apply(_row_style, axis=1)
+
+
+def _render_kpi_cards(totals: dict, pct_specs: list[tuple[str, str]]) -> None:
+    cards = [("Total Volume", f"{totals.get('Volume', 0):,}", "Shipments in range", "#4a90d9")]
+    for label, _ in pct_specs[:5]:
+        val = totals.get(label, 0)
+        if label == "Conversion %":
+            border = "#28a745"
+        elif "Failed" in label or "Not Attempted" in label:
+            border = "#dc3545"
+        else:
+            border = "#f0ad4e"
+        cards.append((label, f"{val:.2f}%", "Across selected range", border))
+
+    html = '<div class="kpi-row">'
+    for title, val, sub, color in cards:
+        html += (
+            f'<div class="kpi-card" style="border-top-color:{color}">'
+            f'<h4>{title}</h4><div class="val">{val}</div><p class="sub">{sub}</p></div>'
+        )
+    html += "</div>"
+    st.markdown(html, unsafe_allow_html=True)
+
+
+def _date_range_inputs(df: pd.DataFrame, key_prefix: str) -> Optional[tuple[object, object]]:
+    valid = df["RequestDate"].dropna()
+    if valid.empty:
+        st.warning("No valid dates in the CSV.")
+        return None
+    min_d, max_d = valid.min(), valid.max()
+    c1, c2 = st.columns(2)
+    with c1:
+        start = st.date_input(
+            "From", value=min_d, min_value=min_d, max_value=max_d,
+            format="YYYY-MM-DD", key=f"{key_prefix}_from",
+        )
+    with c2:
+        end = st.date_input(
+            "To", value=max_d, min_value=min_d, max_value=max_d,
+            format="YYYY-MM-DD", key=f"{key_prefix}_to",
+        )
+    if start > end:
+        st.warning("From date must be on or before To date.")
+        return None
+    return start, end
+
+
+def _metric_config(metric_family: str, df: pd.DataFrame) -> tuple[list[str], list[tuple[str, str]]]:
+    if metric_family == "pickup":
+        return pickup_sum_cols(df), _pct_metrics_for_df(df, _PICKUP_PCT_METRICS)
+    return attempt_sum_cols(df), _pct_metrics_for_df(df, _ATTEMPT_PCT_METRICS)
+
+
+def render_seller_summary_page(metric_family: str) -> None:
+    _inject_dashboard_css()
+    is_pickup = metric_family == "pickup"
+    title = "Seller-wise Pickup Performance" if is_pickup else "Seller-wise Attempt Performance"
+    st.title(title)
+    st.caption("Summarised seller view for the selected date range.")
+
+    df, source = _load_simple_table_data()
+    if df is None:
+        st.info("Place an aggregated CSV in the `data/` folder to get started.")
+        return
+
+    key = metric_family
+    bounds = _date_range_inputs(df, f"summary_{key}")
+    if bounds is None:
+        return
+    start, end = bounds
+    view = df[(df["RequestDate"] >= start) & (df["RequestDate"] <= end)]
+    if view.empty:
+        st.warning("No data in the selected date range.")
+        return
+
+    sum_cols, pct_specs = _metric_config(metric_family, df)
+    summary = _build_seller_summary(view, sum_cols, pct_specs)
+    if summary.empty:
+        st.warning("No rows to display.")
+        return
+
+    st.markdown(
+        f"Showing **{len(summary)}** sellers · Date range: "
+        f"**{format_date(start)}** to **{format_date(end)}** · `{source}`"
+    )
+
+    vol = int(view["total_shipments"].sum())
+    totals: dict = {"Volume": vol}
+    for label, col in pct_specs:
+        num = view[col].sum() if col in view.columns else 0
+        totals[label] = round(num / vol * 100, 2) if vol else 0.0
+    _render_kpi_cards(totals, pct_specs)
+
+    st.markdown(
+        '<div class="legend-box">'
+        '<span style="background:#d4edda;padding:2px 8px;border-radius:3px">Green = good</span> '
+        '<span style="background:#fff3cd;padding:2px 8px;border-radius:3px">Yellow = caution</span> '
+        '<span style="background:#f8d7da;padding:2px 8px;border-radius:3px">Red = alert</span>'
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+    search = st.text_input("Search seller type...", key=f"summary_search_{key}")
+    display = summary
+    if search.strip():
+        display = summary[summary["Seller"].str.contains(search.strip(), case=False, na=False)]
+
+    pct_cols = [label for label, _ in pct_specs]
+    st.dataframe(_style_report_table(display, pct_cols), use_container_width=True, hide_index=True)
+
+
+def render_period_detail_page(metric_family: str) -> None:
+    _inject_dashboard_css()
+    is_pickup = metric_family == "pickup"
+    title = (
+        "Day-wise Pickup Performance"
+        if is_pickup
+        else "Day-wise Attempt Performance"
+    )
+    st.title(title)
+    st.caption(
+        "Select a date range and one or more sellers. "
+        "Weekly and monthly labels include the actual date span when the period is partial."
+    )
+
+    df, source = _load_simple_table_data()
+    if df is None:
+        st.info("Place an aggregated CSV in the `data/` folder to get started.")
+        return
+
+    key = metric_family
+    valid = df["RequestDate"].dropna()
+    min_d, max_d = valid.min(), valid.max()
+    saved_range = st.session_state.get(f"detail_range_{key}", (min_d, max_d))
+
+    c1, c2, c3 = st.columns([1, 1, 1.5])
+    with c1:
+        start = st.date_input(
+            "From", value=saved_range[0], min_value=min_d, max_value=max_d,
+            format="YYYY-MM-DD", key=f"detail_from_{key}",
+        )
+    with c2:
+        end = st.date_input(
+            "To", value=saved_range[1], min_value=min_d, max_value=max_d,
+            format="YYYY-MM-DD", key=f"detail_to_{key}",
+        )
+    all_sellers = sorted(df["seller_type"].dropna().astype(str).unique().tolist())
+    with c3:
+        sellers = st.multiselect(
+            "Select sellers",
+            options=all_sellers,
+            default=st.session_state.get(f"detail_sellers_{key}", []),
+            placeholder="Choose one or more sellers...",
+            key=f"detail_sellers_pick_{key}",
+        )
+
+    granularity = st.radio(
+        "View by", ("Daily", "Weekly", "Monthly"),
+        horizontal=True, key=f"detail_granularity_{key}",
+    )
+
+    if start > end:
+        st.warning("From date must be on or before To date.")
+        return
+    if not sellers:
+        st.info("Select at least one seller above to load the report.")
+        return
+
+    view = df[
+        (df["RequestDate"] >= start)
+        & (df["RequestDate"] <= end)
+        & (df["seller_type"].isin(sellers))
+    ]
+    if view.empty:
+        st.warning("No rows match the selected filters.")
+        return
+
+    sum_cols, pct_specs = _metric_config(metric_family, df)
+    detail = _build_period_detail(view, start, end, sum_cols, pct_specs, granularity)
+    pct_cols = [label for label, _ in pct_specs]
+    st.caption(
+        f"{len(detail)} rows · {granularity.lower()} · "
+        f"{format_date(start)} to {format_date(end)} · `{source}`"
+    )
+    st.dataframe(_style_report_table(detail, pct_cols), use_container_width=True, hide_index=True)
+
+
+def _available_weeks(df: pd.DataFrame) -> list[tuple[object, str]]:
+    starts = (
+        df["WeekStart"].dropna().drop_duplicates().sort_values().tolist()
+    )
+    return [(ws, _week_label(ws)) for ws in starts]
+
+
+def _available_months(df: pd.DataFrame) -> list[tuple[object, str]]:
+    starts = (
+        df["MonthStart"].dropna().drop_duplicates().sort_values().tolist()
+    )
+    return [(ms, _month_label(ms)) for ms in starts]
+
+
+def _render_simple_filters(
+    df: pd.DataFrame, key_prefix: str,
+) -> Optional[tuple[pd.DataFrame, object, object, str]]:
+    """Period + seller_type filters. Returns (view, start, end, seller) or None."""
+    valid_dates = df["RequestDate"].dropna()
+    if valid_dates.empty:
+        st.warning("No valid dates in the CSV.")
+        return None
+
+    min_date, max_date = valid_dates.min(), valid_dates.max()
+    sellers = sorted(df["seller_type"].dropna().astype(str).unique().tolist())
+
+    period = st.radio(
+        "Period",
+        ("Day", "Week", "Month"),
+        horizontal=True,
+        key=f"{key_prefix}_period",
+    )
+
+    filter_col, seller_col = st.columns(2)
+    start, end = None, None
+
+    with filter_col:
+        if period == "Day":
+            date_range = st.date_input(
+                "Date range",
+                value=(min_date, max_date),
+                min_value=min_date,
+                max_value=max_date,
+                format="YYYY-MM-DD",
+                key=f"{key_prefix}_date_range",
+            )
+            if not (isinstance(date_range, tuple) and len(date_range) == 2):
+                st.warning("Select a start and end date.")
+                return None
+            start, end = date_range
+            view = df[(df["RequestDate"] >= start) & (df["RequestDate"] <= end)]
+        elif period == "Week":
+            weeks = _available_weeks(df)
+            if not weeks:
+                st.warning("No weekly periods in the data.")
+                return None
+            labels = [label for _, label in weeks]
+            pick = st.selectbox("Week", labels, key=f"{key_prefix}_week")
+            week_start = next(ws for ws, lb in weeks if lb == pick)
+            start = week_start
+            end = week_start + timedelta(days=6)
+            view = df[df["WeekStart"] == week_start]
+        else:  # Month
+            months = _available_months(df)
+            if not months:
+                st.warning("No monthly periods in the data.")
+                return None
+            labels = [label for _, label in months]
+            pick = st.selectbox("Month", labels, key=f"{key_prefix}_month")
+            month_start = next(ms for ms, lb in months if lb == pick)
+            view = df[df["MonthStart"] == month_start]
+            start = month_start
+            end = view["RequestDate"].max() if not view.empty else month_start
+
+    with seller_col:
+        seller = st.selectbox(
+            "seller_type",
+            ["All"] + sellers,
+            key=f"{key_prefix}_seller",
+        )
+
+    if seller != "All":
+        view = view[view["seller_type"] == seller]
+    if view.empty:
+        st.warning("No rows match the selected filters.")
+        return None
+    return view, start, end, seller
+
+
+def _render_summary_table(
+    view: pd.DataFrame,
+    start,
+    end,
+    seller: str,
+    source: str,
+    sum_cols: list[str],
+    key_prefix: str,
+    conversion_col: Optional[str] = None,
+) -> None:
+    display_mode = st.radio(
+        "Display values as",
+        ("Counts", "% of row"),
+        horizontal=True,
+        key=f"{key_prefix}_display_mode",
+    )
+    as_percent = display_mode == "% of row"
+    display = summarize_metrics(
+        view, start, end, sum_cols,
+        include_grand_total=(seller == "All"),
+        as_percent=as_percent,
+        conversion_col=conversion_col if as_percent else None,
+    )
+    st.caption(
+        f"Summarised over {format_date(start)}–{format_date(end)} · "
+        f"{len(view):,} daily rows rolled up · source: `{source}`"
+    )
+    if as_percent:
+        fmt = {
+            c: "{:.2f}%" if c == "Conversion %" else "{:.1f}%"
+            for c in display.columns
+            if c not in ("date_range", "seller_type", "total_shipments")
+        }
+        fmt["total_shipments"] = "{:,}"
+        styled = display.style.format(fmt, na_rep="-")
+    else:
+        styled = display.style.format(
+            {c: "{:,}" for c in display.columns if c not in ("date_range", "seller_type")},
+            na_rep="-",
+        )
+    st.dataframe(styled, use_container_width=True, hide_index=True)
+
+
 # ---------------------------------------------------------------------------
 # Entrypoint
 # ---------------------------------------------------------------------------
@@ -1454,10 +2215,10 @@ def render_trends_page() -> None:
 def main() -> None:
     st.set_page_config(page_title="RVP Pickup Dashboard", layout="wide")
     pages = [
-        st.Page(render_pickup_page, title="Pickup Performance", default=True),
-        st.Page(render_attempt_page, title="Attempt Performance"),
-        st.Page(render_pincode_performance_page, title="Pincode Performance"),
-        st.Page(render_trends_page, title="Trends"),
+        st.Page(render_pickup_page, title="Pickup Summary", default=True),
+        st.Page(render_pickup_period_page, title="Pickup Period Detail"),
+        st.Page(render_attempt_page, title="Attempt Summary"),
+        st.Page(render_attempt_period_page, title="Attempt Period Detail"),
     ]
     try:
         nav = st.navigation(pages, position="top")
