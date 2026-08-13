@@ -2072,13 +2072,6 @@ def render_seller_summary_page(metric_family: str) -> None:
         st.info("Place an aggregated CSV in the `data/` folder to get started.")
         return
 
-    if "converted" not in df.columns:
-        st.warning(
-            "Legacy CSV detected — Cancelled After D2 % is computed as non-converted "
-            "(100% − Conversion %). For shipment-level cancellation detail, "
-            "use the latest export with `converted` / `cancelled_after_d2` columns."
-        )
-
     key = metric_family
     bounds = _date_range_inputs(df, f"summary_{key}")
     if bounds is None:
