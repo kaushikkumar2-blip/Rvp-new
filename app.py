@@ -477,7 +477,16 @@ def _resolve_default_csv_path() -> Optional[Path]:
     if DEFAULT_CSV_PATH.is_file():
         return DEFAULT_CSV_PATH
     csvs = sorted(DATA_DIR.glob("*.csv"), key=lambda p: p.stat().st_mtime, reverse=True)
-    return csvs[0] if csvs else None
+    if not csvs:
+        return None
+    # Prefer the current export schema (has `converted`) over legacy daily files.
+    new_schema = [
+        p for p in csvs
+        if "converted" in pd.read_csv(p, nrows=0).columns
+    ]
+    if new_schema:
+        return max(new_schema, key=lambda p: p.stat().st_mtime)
+    return csvs[0]
 
 
 @st.cache_data(show_spinner=False)
@@ -499,7 +508,11 @@ def is_aggregated_shipment_csv(columns) -> bool:
     cols = set(columns)
     return (
         "total_shipments" in cols
-        and "pickup_d0" in cols
+        and (
+            "converted" in cols
+            or "pickup_d0" in cols
+            or "pickup_d2_cum" in cols
+        )
         and "vendor_tracking_id" not in cols
     )
 
@@ -533,16 +546,43 @@ def parse_aggregated_csv(content: bytes) -> pd.DataFrame:
     return df
 
 
+def _first_col(df: pd.DataFrame, *names: str) -> Optional[str]:
+    for name in names:
+        if name in df.columns:
+            return name
+    return None
+
+
+def _is_pickup_sum_col(name: str, df: pd.DataFrame) -> bool:
+    if name.endswith("_pct") or name == "converted":
+        return False
+    if name.startswith("pickup_") or name.startswith("cancelled"):
+        return True
+    return name in {"qc_failed", "not_attempted", "pending"}
+
+
+def _is_attempt_sum_col(name: str, df: pd.DataFrame) -> bool:
+    if name.endswith("_pct"):
+        return False
+    if name.startswith("attempt_"):
+        return True
+    if name.startswith("cancelled"):
+        return "attempt_cancelled" not in df.columns or name != "cancelled"
+    return name in {"qc_failed", "not_attempted", "pending"}
+
+
 def pickup_sum_cols(df: pd.DataFrame) -> list[str]:
     """Count columns for pickup view — follows CSV column order."""
     cols: list[str] = []
     if "total_shipments" in df.columns:
         cols.append("total_shipments")
+    conv_col = _first_col(df, "converted", "pickup_d4plus_cum")
+    if conv_col and conv_col not in cols:
+        cols.append(conv_col)
     for c in df.columns:
-        if c in cols or c.endswith("_pct"):
+        if c in cols or not _is_pickup_sum_col(c, df):
             continue
-        if c.startswith("pickup_") or c.startswith("cancelled"):
-            cols.append(c)
+        cols.append(c)
     return cols
 
 
@@ -552,10 +592,9 @@ def attempt_sum_cols(df: pd.DataFrame) -> list[str]:
     if "total_shipments" in df.columns:
         cols.append("total_shipments")
     for c in df.columns:
-        if c in cols or c.endswith("_pct"):
+        if c in cols or not _is_attempt_sum_col(c, df):
             continue
-        if c.startswith("attempt_") or c.startswith("cancelled"):
-            cols.append(c)
+        cols.append(c)
     return cols
 
 
@@ -577,10 +616,11 @@ def _agg_sum_pivot(
 
 
 def _agg_conversion_table(df: pd.DataFrame) -> pd.DataFrame:
+    picked_col = _first_col(df, "converted", "pickup_d4plus_cum") or "pickup_d4plus_cum"
     agg = df.groupby("seller_type", dropna=False).agg(
         **{
             "Total Shipments": ("total_shipments", "sum"),
-            "Picked Shipments": ("pickup_d4plus_cum", "sum"),
+            "Picked Shipments": (picked_col, "sum"),
         }
     )
     agg["Conversion %"] = (
@@ -1742,35 +1782,65 @@ _DASHBOARD_CSS = """
 </style>
 """
 
-_PICKUP_PCT_METRICS = [
-    ("D0 %", "pickup_d0"),
-    ("D1 cum %", "pickup_d1_cum"),
-    ("D2 cum %", "pickup_d2_cum"),
-    ("QC Failed %", "pickup_qc_failed"),
-    ("Not Attempted %", "pickup_not_attempted"),
-    ("Conversion %", "pickup_d4plus_cum"),
-    ("Cancelled %", "cancelled"),
-    ("Cancelled D2 cum %", "cancelled_d2_cum"),
-    ("Cancelled D2 %", "cancelled_d2"),  # legacy column name
+_PICKUP_PCT_METRIC_CANDIDATES = [
+    ("D0 %", ("pickup_d0_pct", "pickup_d0")),
+    ("D1 cum %", ("pickup_d1_cum_pct", "pickup_d1_cum")),
+    ("D2 cum %", ("pickup_d2_cum_pct", "pickup_d2_cum")),
+    ("QC Failed %", ("qc_failed_pct", "pickup_qc_failed_pct", "qc_failed", "pickup_qc_failed")),
+    ("Not Attempted %", ("not_attempted_pct", "pickup_not_attempted_pct", "not_attempted", "pickup_not_attempted")),
+    ("Pending %", ("pending_pct", "pickup_pending_pct", "pending", "pickup_pending")),
+    ("Conversion %", ("converted_pct", "converted", "pickup_d4plus_cum_pct", "pickup_d4plus_cum")),
+    ("Cancelled After D2 %", ("cancelled_pct", "cancelled_after_d2")),
+    ("Cancelled D2 cum %", ("cancelled_d2_cum_pct", "cancelled_d2_cum")),
+    ("Cancelled D2 %", ("cancelled_d2_pct", "cancelled_d2")),  # legacy column name
 ]
-_ATTEMPT_PCT_METRICS = [
-    ("Attempt D0 %", "attempt_d0"),
-    ("Attempt D1 cum %", "attempt_d1_cum"),
-    ("Attempt D2 cum %", "attempt_d2_cum"),
-    ("Attempt QC Failed %", "attempt_qc_failed"),
-    ("Attempt Not Attempted %", "attempt_not_attempted"),
-    ("Cancelled %", "cancelled"),
-    ("Cancelled D2 cum %", "cancelled_d2_cum"),
-    ("Cancelled D2 %", "cancelled_d2"),  # legacy column name
+_ATTEMPT_PCT_METRIC_CANDIDATES = [
+    ("Attempt D0 %", ("attempt_d0_pct", "attempt_d0")),
+    ("Attempt D1 cum %", ("attempt_d1_cum_pct", "attempt_d1_cum")),
+    ("Attempt D2 cum %", ("attempt_d2_cum_pct", "attempt_d2_cum")),
+    ("Attempt QC Failed %", ("attempt_qc_failed_pct", "attempt_qc_failed")),
+    ("Attempt Not Attempted %", ("attempt_not_attempted_pct", "attempt_not_attempted")),
+    ("Cancelled After D2 %", ("attempt_cancelled_pct", "attempt_cancelled", "cancelled_pct", "cancelled_after_d2")),
+    ("Cancelled D2 cum %", ("cancelled_d2_cum_pct", "cancelled_d2_cum")),
+    ("Cancelled D2 %", ("cancelled_d2_pct", "cancelled_d2")),  # legacy column name
 ]
+
+
+def _pct_metrics_for_df(
+    df: pd.DataFrame,
+    candidates: list[tuple[str, tuple[str, ...]]],
+) -> list[tuple[str, str]]:
+    specs: list[tuple[str, str]] = []
+    for label, names in candidates:
+        col = _first_col(df, *names)
+        if col:
+            specs.append((label, col))
+    return specs
+
+
+def _pickup_pct_metrics(df: pd.DataFrame) -> list[tuple[str, str]]:
+    return _pct_metrics_for_df(df, _PICKUP_PCT_METRIC_CANDIDATES)
+
+
+def _attempt_pct_metrics(df: pd.DataFrame) -> list[tuple[str, str]]:
+    return _pct_metrics_for_df(df, _ATTEMPT_PCT_METRIC_CANDIDATES)
 
 
 def _inject_dashboard_css() -> None:
     st.markdown(_DASHBOARD_CSS, unsafe_allow_html=True)
 
 
-def _pct_metrics_for_df(df: pd.DataFrame, specs: list[tuple[str, str]]) -> list[tuple[str, str]]:
-    return [(label, col) for label, col in specs if col in df.columns]
+def _kpi_metric_labels(pct_specs: list[tuple[str, str]]) -> list[str]:
+    """Keep Conversion + Cancelled visible even when other outcome buckets exist."""
+    labels = [label for label, _ in pct_specs]
+    ordered: list[str] = []
+    for preferred in ("Conversion %", "Cancelled After D2 %", "D2 cum %", "Attempt D2 cum %"):
+        if preferred in labels and preferred not in ordered:
+            ordered.append(preferred)
+    for label in labels:
+        if label not in ordered:
+            ordered.append(label)
+    return ordered[:5]
 
 
 def _week_label_bounded(week_start, range_start, range_end) -> str:
@@ -1793,20 +1863,62 @@ def _month_label_bounded(month_start, range_start, range_end) -> str:
     return label
 
 
+def _metric_numerator(sums: dict[str, float], label: str, col: str) -> float:
+    """Count used for a % metric. Legacy exports under-count `cancelled`."""
+    if label != "Cancelled After D2 %":
+        return sums.get(col, 0) or 0
+    if "converted" in sums:
+        return sums.get(col, 0) or 0
+    vol = sums.get("total_shipments", 0) or 0
+    if "attempt_d4plus_cum" in sums:
+        return max(vol - (sums.get("attempt_d4plus_cum", 0) or 0), 0)
+    if "pickup_d4plus_cum" in sums:
+        return max(vol - (sums.get("pickup_d4plus_cum", 0) or 0), 0)
+    return sums.get(col, 0) or 0
+
+
+def _view_metric_numerator(view: pd.DataFrame, label: str, col: str) -> float:
+    if col.endswith("_pct"):
+        return (view[col] * view["total_shipments"]).sum() / 100
+    if label == "Cancelled After D2 %" and "converted" not in view.columns:
+        vol = view["total_shipments"].sum()
+        if "attempt_d4plus_cum" in view.columns:
+            return max(vol - view["attempt_d4plus_cum"].sum(), 0)
+        picked_col = _first_col(view, "converted", "pickup_d4plus_cum")
+        if picked_col:
+            return max(vol - view[picked_col].sum(), 0)
+    return view[col].sum() if col in view.columns else 0
+
+
+def _metrics_from_group(
+    group: pd.DataFrame, pct_specs: list[tuple[str, str]],
+) -> dict:
+    vol = group["total_shipments"].sum()
+    row: dict = {"Volume": int(vol)}
+    for label, col in pct_specs:
+        num = _view_metric_numerator(group, label, col)
+        row[label] = round(num / vol * 100, 2) if vol else 0.0
+    return row
+
+
 def _metrics_from_sums(sums: dict[str, float], pct_specs: list[tuple[str, str]]) -> dict:
     vol = sums.get("total_shipments", 0) or 0
     row: dict = {"Volume": int(vol)}
     for label, col in pct_specs:
-        num = sums.get(col, 0) or 0
+        num = _metric_numerator(sums, label, col)
         row[label] = round(num / vol * 100, 2) if vol else 0.0
     return row
 
 
 def _order_metric_labels(labels: list[str]) -> list[str]:
-    """Bucket metrics first; Conversion + Cancelled always last."""
-    trailing = [l for l in labels if "Conversion" in l or "Cancelled" in l]
-    leading = [l for l in labels if l not in trailing]
-    return leading + trailing
+    """Place cancellation metrics immediately after the D2 bucket."""
+    cancelled = [l for l in labels if "Cancelled" in l]
+    remaining = [l for l in labels if l not in cancelled]
+    d2_index = next(
+        (i for i, label in enumerate(remaining) if label in {"D2 cum %", "Attempt D2 cum %"}),
+        len(remaining) - 1,
+    )
+    return remaining[: d2_index + 1] + cancelled + remaining[d2_index + 1 :]
 
 
 def _build_seller_summary(
@@ -1815,7 +1927,7 @@ def _build_seller_summary(
     rows = []
     for seller, grp in view.groupby("seller_type", sort=True):
         sums = {c: grp[c].sum() for c in sum_cols if c in grp.columns}
-        row = _metrics_from_sums(sums, pct_specs)
+        row = _metrics_from_group(grp, pct_specs)
         row["Seller"] = str(seller)
         rows.append(row)
     if not rows:
@@ -1847,7 +1959,7 @@ def _build_period_detail(
     rows = []
     for (period_key, seller), grp in view.groupby([period_col, "seller_type"], sort=True):
         sums = {c: grp[c].sum() for c in sum_cols if c in grp.columns}
-        row = _metrics_from_sums(sums, pct_specs)
+        row = _metrics_from_group(grp, pct_specs)
         row["Period"] = label_fn(period_key, grp)
         row["Seller"] = str(seller)
         row["_period_sort"] = pd.Timestamp(period_key)
@@ -1893,11 +2005,13 @@ def _style_report_table(df: pd.DataFrame, pct_cols: list[str]):
 
 def _render_kpi_cards(totals: dict, pct_specs: list[tuple[str, str]]) -> None:
     cards = [("Total Volume", f"{totals.get('Volume', 0):,}", "Shipments in range", "#4a90d9")]
-    for label, _ in pct_specs[:5]:
+    for label in _kpi_metric_labels(pct_specs):
         val = totals.get(label, 0)
         if label == "Conversion %":
             border = "#28a745"
-        elif "Failed" in label or "Not Attempted" in label:
+        elif label == "Cancelled After D2 %":
+            border = "#dc3545"
+        elif "Failed" in label or "Not Attempted" in label or label == "Pending %":
             border = "#dc3545"
         else:
             border = "#f0ad4e"
@@ -1938,8 +2052,12 @@ def _date_range_inputs(df: pd.DataFrame, key_prefix: str) -> Optional[tuple[obje
 
 def _metric_config(metric_family: str, df: pd.DataFrame) -> tuple[list[str], list[tuple[str, str]]]:
     if metric_family == "pickup":
-        return pickup_sum_cols(df), _pct_metrics_for_df(df, _PICKUP_PCT_METRICS)
-    return attempt_sum_cols(df), _pct_metrics_for_df(df, _ATTEMPT_PCT_METRICS)
+        sum_cols = pickup_sum_cols(df)
+        pct_specs = _pickup_pct_metrics(df)
+    else:
+        sum_cols = attempt_sum_cols(df)
+        pct_specs = _attempt_pct_metrics(df)
+    return sum_cols, pct_specs
 
 
 def render_seller_summary_page(metric_family: str) -> None:
@@ -1953,6 +2071,13 @@ def render_seller_summary_page(metric_family: str) -> None:
     if df is None:
         st.info("Place an aggregated CSV in the `data/` folder to get started.")
         return
+
+    if "converted" not in df.columns:
+        st.warning(
+            "Legacy CSV detected — Cancelled After D2 % is computed as non-converted "
+            "(100% − Conversion %). For shipment-level cancellation detail, "
+            "use the latest export with `converted` / `cancelled_after_d2` columns."
+        )
 
     key = metric_family
     bounds = _date_range_inputs(df, f"summary_{key}")
@@ -1978,7 +2103,7 @@ def render_seller_summary_page(metric_family: str) -> None:
     vol = int(view["total_shipments"].sum())
     totals: dict = {"Volume": vol}
     for label, col in pct_specs:
-        num = view[col].sum() if col in view.columns else 0
+        num = _view_metric_numerator(view, label, col)
         totals[label] = round(num / vol * 100, 2) if vol else 0.0
     _render_kpi_cards(totals, pct_specs)
 
